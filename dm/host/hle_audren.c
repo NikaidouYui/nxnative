@@ -130,6 +130,7 @@ static void render_main(void *arg) {
     for (int i = 0; i < NBUF; i++) { a->bufs[i] = (gbuf){a->pcm[i], sizeof a->pcm[i], 0}; free_list[i] = &a->bufs[i]; }
     dm_pcmout_start(out);
     LOG("audren: render thread %d started (%d buffers in flight, paced by the output)", ar_index(a), NBUF);
+    uint64_t last_step_ns = 0, sent_blocks = 0;
     while (atomic_load(&a->open)) {
         while (!nfree) {   // wait for the output to hand a block back (silent sink / sound card, one every 5 ms); it signals each release, so the thread sleeps until then (it used to poll every 1 ms)
             gbuf *b = dm_pcmout_released(out);
@@ -138,6 +139,14 @@ static void render_main(void *arg) {
             if (!atomic_load(&a->open)) break;
         }
         if (!nfree) break;
+        if (sent_blocks >= NBUF && last_step_ns) {
+            // 44.1 kHz CoreAudio 回调（256 帧 = 5.805 ms）每次消耗 48 kHz 下的 278.64 个采样点，每隔约 6.2 次回调会同时释放两个 240 采样点的缓冲块；
+            // 将相邻两次渲染的最小间隔限制在 3.8 ms 以上，确保游戏音频线程在两帧之间有充足时间处理 Aux Send/Return 缓冲区（FxPCMPlayerForFinalMix）
+            uint64_t now = now_ns(), min_next = last_step_ns + 3800000;
+            if (now < min_next) usleep((useconds_t)((min_next - now) / 1000));
+        }
+        last_step_ns = now_ns();
+        sent_blocks++;
         const int16_t *src; int got;
         uint32_t h = atomic_load(&a->cq_head);
         if (h != atomic_load(&a->cq_tail)) { src = a->cq[h % CQ]; got = a->cq_n[h % CQ]; atomic_store(&a->cq_head, h + 1); cq_popped(a); }   // play queued catch-up output first
@@ -395,8 +404,8 @@ static int capture(ar_t *a, const uint8_t *cl, size_t len, int16_t *dst) {
             // Input buffers: the mix buffers the DeviceSink inputs name, at the renderer's rate (with CPU rendering the SDK makes no upsampler, below)
             const int32_t *ch[6]; uint32_t k = nin > 6 ? 6 : nin;
             for (uint32_t j = 0; j < k; j++) ch[j] = mix + (size_t)in[j] * samples;
-            // Channel order front-left front-right center LFE back-left back-right; 6 → 2 with the system default downmix coefficients (front 1.0, center 0.707, LFE 0.251, back 0.707, Q15)
-            enum { CF = 32768, CC = 23167, CL = 8224, CB = 23167 };
+            // 声道顺序：前左、前右、中置、低音炮、后左、后右；6 → 2 下混时将中置声道系数设为 1.0 (32768)，避免 5.1 过场动画中置人声被四声道背景音乐掩盖
+            enum { CF = 32768, CC = 32768, CL = 8224, CB = 19660 };
             static int32_t st[FRAME_MAX * 2];   // the stereo downmix before clamping (capture runs under g_render_mu)
             for (uint32_t s = 0; s < samples; s++) {
                 int32_t l, r;
@@ -556,7 +565,9 @@ HLE_FORCE("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm", "renderer
     ar_t *a = ar_of_sys(sys);
     if (!a) return orig(sys, o, on, p, pn, in, inn);   // two renderers just opened, neither has rendered: at most one catch-up frame less
     uint64_t u = atomic_fetch_add(&a->updates, 1) + 1, r = atomic_load(&a->renders);
-    if (a->updated && r == a->last_r) {
+    int did_catchup = 0;
+    if (a->updated && r <= a->last_r) {
+        did_catchup = 1;
         uint64_t c = atomic_fetch_add(&a->catchups, 1) + 1;
         if (c <= 3) LOG("audren: renderer %d: no frame rendered before update %llu, rendering a catch-up frame first (%llu so far)", ar_index(a), (unsigned long long)u, (unsigned long long)c);
         uint32_t t = atomic_load(&a->cq_tail);
@@ -572,7 +583,10 @@ HLE_FORCE("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm", "renderer
     static int tr = -1; if (tr < 0) tr = getenv("DM_AUDREN_TRACE") != NULL;
     if (tr && u < 200) LOG("audren update #%llu t=%.3f ms, %llu frames rendered since the last update", (unsigned long long)u, now_ns() / 1e6, (unsigned long long)(atomic_load(&a->renders) - (a->updated ? a->last_r : 0)));
     Result res = orig(sys, o, on, p, pn, in, inn);
-    a->last_r = atomic_load(&a->renders); a->updated = 1;
+    if (!a->updated || did_catchup) a->last_r = atomic_load(&a->renders);
+    else if (r - a->last_r >= 2) a->last_r = r - 1;
+    else a->last_r = r;
+    a->updated = 1;
     return res;
 }
 
