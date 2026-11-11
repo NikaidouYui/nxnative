@@ -38,9 +38,9 @@ zip_store	.zst:.mp4:.webm:.metallib
 # ---- Memory ----
 # The Switch 2 leaves games 9 GB of its 12 GB (Donkey Kong Bananza's figure, not measured here). The NPDM declares 64 MB of system resource, so virtual address memory is on.
 # 256 MB in front + alias region + 256 MB stack region + heap region: Splatoon Raiders' split as a starting point, to be measured
-mem_reserve	0x550000000
-mem_alias	0x400000000
-mem_stack	0x10000000
+mem_reserve	0x140000000
+mem_alias	0x12c000000
+mem_stack	0x4000000
 app_pool	0x240000000
 sys_resource	0x4000000
 
