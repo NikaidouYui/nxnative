@@ -503,6 +503,9 @@ void front_ios_audio_session(void) {
     if (![s setPreferredIOBufferDuration:0.005 error:&e]) LOG("[RED] audio session I/O buffer duration could not be set: %s", e.localizedDescription.UTF8String);
     g_session_off = ![s setActive:YES error:&e];
     if (g_session_off) LOG("[RED] audio session activation failed: %s", e.localizedDescription.UTF8String);
+    // 激活音频会话后再次请求 48kHz 与 5ms I/O 缓冲时长，防止 iOS 路由切换或会话激活后重置为 23ms (1024 frames)
+    [s setPreferredSampleRate:48000 error:nil];
+    [s setPreferredIOBufferDuration:0.005 error:nil];
     LOG("audio session: sample rate %.0f Hz, I/O buffer %.2f ms (asked for 5 ms)", s.sampleRate, s.IOBufferDuration * 1000);
 }
 

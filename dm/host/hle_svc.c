@@ -314,9 +314,36 @@ static void mem_init_once(void) {
 #endif
     const char *as = getenv("DM_ALIAS_SIZE");
     if (as && *as) { alias = (size_t)strtoull(as, NULL, 0); if (alias < 0x10000000 || (alias & (pg - 1))) die("DM_ALIAS_SIZE %s: at least 256 MB, in whole host pages", as); }
-    g_reserve = RESERVE - DM_GAME_MEM_ALIAS + alias;
-    g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (g_as == MAP_FAILED) die("reserve guest AS");
+    if (!g_as) {
+#if TARGET_OS_IPHONE
+        // 当宿主容器支持 extended-virtual-addressing 权限时，自动探测并使用更大的 alias 虚拟地址空间（同时校验宿主仍保留至少 2 GB 连续地址空间供 Metal 使用）
+        if ((!as || !*as) && DM_GAME_APP_POOL > (uint64_t)4 << 30) {
+            static const size_t probe_aliases[] = { (size_t)16 << 30, (size_t)12 << 30, (size_t)8 << 30 };
+            for (size_t i = 0; i < sizeof(probe_aliases) / sizeof(probe_aliases[0]); i++) {
+                if (probe_aliases[i] <= alias) continue;
+                size_t try_res = RESERVE - DM_GAME_MEM_ALIAS + probe_aliases[i];
+                uint8_t *try_as = mmap(NULL, try_res, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+                if (try_as != MAP_FAILED) {
+                    void *host_guard = mmap(NULL, (size_t)2 << 30, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+                    if (host_guard != MAP_FAILED) {
+                        munmap(host_guard, (size_t)2 << 30);
+                        alias = probe_aliases[i];
+                        g_reserve = try_res;
+                        g_as = try_as;
+                        LOG("[mem] iOS extended virtual addressing active: alias expanded to %.2f GB (reserve %.2f GB)", alias / 1073741824.0, g_reserve / 1073741824.0);
+                        break;
+                    }
+                    munmap(try_as, try_res);
+                }
+            }
+        }
+#endif
+        if (!g_as) {
+            g_reserve = RESERVE - DM_GAME_MEM_ALIAS + alias;
+            g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (g_as == MAP_FAILED) die("reserve guest AS");
+        }
+    }
     guest_file_init();
     // Fixed partition (all inside the reserved block): 256 MB in front, the heap, the stacks, then the alias region. Mario: a heap region of 1.625 GB, stack 256 MB, alias 2.875 GB.
     // The alias region is last because a Switch's addresses stay below 2^39 and a 64 GB alias region cannot: macOS 27 reserves 0x1000000000-0x7000000000, which leaves exactly 64 GB below
