@@ -25,6 +25,14 @@ zip_store	.pak:.ttf:.txt:.ucas:.utoc:.metallib
 # ---- Graphics ----
 # 60 fps (30 on the Switch): the host writes rhi.SyncInterval 1 whenever the game sets it back (hle_fpslock.c), as the registered JP profile (dm/games/0100606026F12000)
 fps_target	60
+# Unreal Engine 5.6 按真实流逝时间步进，关闭呈现平滑保持避免大招峰值偶发超时后连续数秒被锁在 30 fps
+fps_hold	off
+# 快照呈现立即归还交换链纹理，减少游戏主线程等待可写图像
+present_snap	on
+# 启用 iOS Metal 4 渲染管线路径（持久化管线归档、微秒级颜色附件特化、混合替身管线）并打包离线计算与基础管线归档，消除战斗招式与过场编译卡顿
+pso_mtl4	on
+# 常规 3D 网格与粒子管线未命中时异步投递后台多核构建并跳过当前未就绪绘制，彻底消除召唤兽登场与必杀技镜头切换的同步编译冻结
+pso_async	on
 
 # ---- Memory ----
 # Unreal Engine 5.6.1: the allocator is replaced by the host's (hle_uemalloc.c layout UE5_6; the constructor call cut by dm/tools/ue_malloc.py) and the engine region given what the
@@ -44,6 +52,10 @@ pad_layout	full
 # ---- NVN ----
 # 2,077 vertex shaders (Unreal's particle vertex factories) pick one of several c2 table slots at run time (as the registered JP profile)
 tex_dyn_slots	on
+# Unreal Engine 5.6 运行时将 NVN 深度模式设为 near=0（顶点着色器采用 main0_z 入口），离线管线归档必须按 zero 模式构建以匹配真机校验
+depth_mode	zero
+# 遵循 Unreal Engine 5 RDG 自身的命令缓冲屏障，允许跨渲染通道的顶点工作与上一通道的片元阶段在 GPU 上重叠执行，降低复杂特效场景帧耗时
+draw_barriers	game
 
 # ---- Shader split ----
 # the decoded shader code archives: the engine's global shaders and the game's material shaders

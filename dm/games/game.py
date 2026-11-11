@@ -173,6 +173,9 @@ def header_one(g):
     if ps not in ('on', 'off'): sys.exit(f'{g.id}: present_snap must be on or off: {ps}')
     p4 = g.get('pso_mtl4', 'off')   # render pipelines through MTL4Compiler on iOS by default, with the pipeline archive and hybrid pipelines (on by default on the Mac; DM_PSO_MTL4 overrides): on / off
     if p4 not in ('on', 'off'): sys.exit(f'{g.id}: pso_mtl4 must be on or off: {p4}')
+    # 常规 3D 网格与粒子管线未命中且无就绪替身基座时异步投递后台构建并跳过当前未就绪绘制，消除实时过场与大招同步编译卡顿（DM_PSO_ASYNC 可覆盖）：on / off
+    pa = g.get('pso_async', 'off')
+    if pa not in ('on', 'off'): sys.exit(f'{g.id}: pso_async must be on or off: {pa}')
     pg = g.words('pso_gpu', '')   # GPU architectures the app gets the pipeline archive made offline for (the NSP script's --gpu, build_ipa.sh): when pso_mtl4 is on the app gets these instead of the default g18p, the A19 / A19 Pro of the iPhone 17 family (e.g. 'applegpu_g19p' for a device of the family after it); unset → the default. Whitespace-separated tokens, with or without the applegpu_ prefix
     if pg and (len(pg) > 4 or any(w == 'none' or not re.fullmatch(r'(applegpu_)?[A-Za-z0-9]+', w) for w in pg)):
         sys.exit(f"{g.id}: pso_gpu takes 1-4 whitespace-separated GPU architectures such as 'g18p applegpu_g19p' (each an optional applegpu_ prefix then an alphanumeric token; there is no none: omit the key for g18p with pso_mtl4 on, or no archive with pso_mtl4 off): {pg}")
@@ -249,6 +252,7 @@ def header_one(g):
          f'#define DM_GAME_UE_FPS_CVAR {q(ufc)}',
          f'#define DM_GAME_PRESENT_SNAP {int(ps == "on")}',
          f'#define DM_GAME_PSO_MTL4 {int(p4 == "on")}',
+         f'#define DM_GAME_PSO_ASYNC {int(pa == "on")}',
          f'#define DM_GAME_ENC_THREAD {int(et == "on")}',
          *([f'#define DM_GAME_SHARED_FONT_TTF {int(sf == "ttf")}'] if g.get('shared_font', '') else []),   # without the key the host decides by the SDK version (hle_sdk16.c)
          f'#define DM_GAME_PAD_LAYOUT {("simple", "full", "touch").index(pl)}',

@@ -34,6 +34,7 @@ DM_SCREEN_ASPECT	choice	auto=匹配屏幕?platform:ios,1.43=iPhone 折叠屏 (1.
 DM_PRESENT_SNAP	toggle	-	DM_GAME_PRESENT_SNAP	gfxapi:nvn	Performance	帧缓冲	最多可能增加 1 帧的画面显示延迟。
 DM_PSO_MTL4	toggle	-	DM_GAME_PSO_MTL4|1	gfxapi:nvn	Performance	Metal 4 渲染管线	保存渲染管线缓存，会占用更多内存。
 DM_PSO_PREBUILD	toggle	-	1	gfxapi:nvn	Performance	启动时预编译管线	首次启动游戏时需要等待几分钟进行预编译（仅需一次）。	needs=DM_PSO_MTL4=1
+DM_PSO_ASYNC	toggle	-	DM_GAME_PSO_ASYNC	DM_GAME_PSO_ASYNC!=0	Performance	异步编译管线	新特效管线在后台编译以避免画面卡顿，首次出现的特效可能延后 1–2 帧显示。
 DM_NVN_ENC_THREAD	toggle	-	1|DM_GAME_ENC_THREAD	gfxapi:nvn	Performance	独立编码线程
 DM_FPS_HOLD	toggle	on/off	DM_GAME_FPS_HOLD	DM_GAME_FPS_TARGET!=0	Performance	掉帧平滑保持
 DM_METAL_HUD	toggle	-	0	always	Performance	Metal 性能监控 (HUD)

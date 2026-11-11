@@ -7261,7 +7261,8 @@ static const prog_t *bind_stages(const prog_t *p, int stages) {
     if (!v) return NULL;
     int same = 1; for (int st = 1; st < 5; st++) if (S.bst[st] && S.bst[st] != v) same = 0;
     if (same && S.bst[1] == v) return v;
-    enum { NCMP = 64 };
+    // 扩大分离阶段绑定的复合程序环形缓存槽位数，消除大型多材质场景（如 Unreal Engine 5）单次提交内频繁溢出重建
+    enum { NCMP = 1024 };
     static prog_t cp[NCMP]; static const prog_t *ck[NCMP][5]; static uint64_t cs[NCMP][5]; static int ncp, next;
     for (int i = 0; i < ncp; i++) {
         int hit = 1; for (int st = 0; st < 5 && hit; st++) hit = ck[i][st] == S.bst[st] && (!S.bst[st] || cs[i][st] == S.bst[st]->serial);
@@ -9054,9 +9055,19 @@ enum { PSO_PEND_ACTIVE = 2, PSO_PREDICT_BUDGET = 2 };
 // pso_pend_take); gen tells a slot's fills apart, so a worker whose slot was taken that way and filled again does nothing
 static struct { pso_key k; id<MTLRenderPipelineState> ps; MTLRenderPipelineDescriptor *d; int used, done, run, demand; uint32_t gen; uint64_t order; } g_pp[PSO_PEND_MAX];
 static pthread_mutex_t g_pp_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pp_cv = PTHREAD_COND_INITIALIZER;
-static uint64_t g_pp_submit_mark, g_pp_kicked, g_pp_taken, g_pp_stolen;   // Whether this submission has already been predicted (by submission serial); cumulative kicked / taken counts
+static uint64_t g_pp_submit_mark, g_pp_exhaust_sub, g_pp_kicked, g_pp_taken, g_pp_stolen;   // Whether this submission has already been predicted (by submission serial); cumulative kicked / taken counts
 static void pso_predict_rest(void);
+static void pso_predict_rest_(void);
+static void shader_prefetch_rest(void);
 static int pso_pend_find(const pso_key *k) { for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && !memcmp(&g_pp[i].k, k, sizeof *k)) return i; return -1; }
+// 统计当前尚未完成的后台推测编译槽位数，供大型提交内的滑动窗口补充预测判断
+static int pso_pend_spec_active(void) {
+    int active = 0;
+    pthread_mutex_lock(&g_pp_mu);
+    for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && !g_pp[i].done && !g_pp[i].demand) active++;
+    pthread_mutex_unlock(&g_pp_mu);
+    return active;
+}
 static int hybrid_on(void);
 // The queue of the builds hybrid draws asked for (the draw has a pulling stand-in, so nothing waits for them): serial queues at utility QoS, one per two performance cores, round
 // robin. At user-initiated QoS on the global queue, a cold start's burst (777 builds on entering Zora's Domain, Breath of the Wild) ran on every core, beside the game's own threads,
@@ -9064,6 +9075,8 @@ static int hybrid_on(void);
 static dispatch_queue_t pp_bg_queue(void) {
     static dispatch_queue_t q[8]; static int n; static _Atomic unsigned rr; static dispatch_once_t once;
     dispatch_once(&once, ^{ int pc = 0; size_t sz = sizeof pc; if (sysctlbyname("hw.perflevel0.physicalcpu", &pc, &sz, NULL, 0) || pc < 2) pc = 2;
+        // 在仅含 2 个首层大核的多簇芯片（如 iPhone A19 的 2P+4E）上按活跃总核数折半分配 utility 队列，避免后台拉取基座编译退化为单队列串行
+        if (pc < 4) { int ac = 0; sz = sizeof ac; if (!sysctlbyname("hw.activecpu", &ac, &sz, NULL, 0) && ac > pc) pc = ac; }
         n = pc / 2 > 8 ? 8 : pc / 2;
         for (int i = 0; i < n; i++) q[i] = dispatch_queue_create("dm.nvn.pso-bg", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
     return q[atomic_fetch_add(&rr, 1) % (unsigned)n];
@@ -9109,12 +9122,39 @@ static int pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // No
     return 1;
 }
 // The build a hybrid draw asked for while it draws with its stand-in: outside the speculative limit, on pp_bg_queue
-static int pso_pend_demand(const pso_key *k, NvShader *vs, NvShader *fs) {
+static int pso_pend_demand_q(const pso_key *k, NvShader *vs, NvShader *fs, dispatch_queue_t q) {
     if (hm_get_id(&g_pso, k)) return 0;
     pthread_mutex_lock(&g_pp_mu); uint32_t gen = 0; int slot = pso_pend_slot(k, 0, &gen); pthread_mutex_unlock(&g_pp_mu);
     if (slot < 0) return 0;
-    pso_pend_start(slot, gen, pso_desc(k, vs, fs, nil, 0), !k->border, pp_bg_queue());
+    pso_pend_start(slot, gen, pso_desc(k, vs, fs, nil, 0), !k->border, q);
     return 1;
+}
+static int pso_pend_demand(const pso_key *k, NvShader *vs, NvShader *fs) { return pso_pend_demand_q(k, vs, fs, pp_bg_queue()); }
+#ifndef DM_GAME_PSO_ASYNC
+#define DM_GAME_PSO_ASYNC 0
+#endif
+// 供异步非阻塞管线构建使用的受控高响应后台队列（2~3 条串行队列轮询，避免挤占全部核心同时保证 1~2 帧内完成编译）
+static dispatch_queue_t pp_async_queue(void) {
+    static dispatch_queue_t q[3]; static int n; static _Atomic unsigned rr; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        int ac = 0; size_t sz = sizeof ac;
+        if (sysctlbyname("hw.activecpu", &ac, &sz, NULL, 0) || ac < 4) ac = 4;
+        n = ac / 2 > 3 ? 3 : ac / 2;
+        dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, -4);
+        for (int i = 0; i < n; i++) q[i] = dispatch_queue_create("dm.nvn.pso-async", attr);
+    });
+    return q[atomic_fetch_add(&rr, 1) % (unsigned)n];
+}
+// 判断当前是否启用常规 3D 顶点拉取管线的异步非阻塞构建模式（仅在 Metal 4 编译器可用时生效）
+static int pso_async_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_PSO_ASYNC"); pso4_init();
+        int on = e ? (!strcmp(e, "1") || !strcmp(e, "on")) : DM_GAME_PSO_ASYNC;
+        v = g_comp4 && on;
+        if (v) MLOG("async 3D pipelines on: uncached vertex-pulling draws build in the background without stalling (DM_PSO_ASYNC=0 turns it off)");
+    }
+    return v;
 }
 // Called by the submit thread: a build in the table is taken (waited for while its worker runs it; made here at once while it is still queued, so a draw that waits waits for its
 // own pipeline alone, not for the builds queued before it: Breath of the Wild's cold start waited 0.5-0.9 s for one pipeline behind a burst); nil when it is not in the table
@@ -9162,22 +9202,27 @@ static MTLRenderPipelineDescriptor *pso_desc_pull(const pso_key *k, NvShader *vs
     d.vertexFunction = pf; d.vertexDescriptor = [MTLVertexDescriptor vertexDescriptor];
     return d;
 }
-static __unsafe_unretained id<MTLRenderPipelineState> hybrid_get(const pso_key *k, NvShader *vs, NvShader *fs) {
+// 查询或特化混合替身管线；kick_bg 为 0 时仅使用已就绪或已归档的拉取基座，不在后台触发未知着色器对的拉取基座编译以避免编译器争用
+static __unsafe_unretained id<MTLRenderPipelineState> hybrid_get_ex(const pso_key *k, NvShader *vs, NvShader *fs, int kick_bg) {
     __unsafe_unretained id<MTLRenderPipelineState> h = hm_get_id(&g_pso_hy, k);
     if (h) return h;
     MTLRenderPipelineDescriptor *d = vs->has_pull ? pso_desc_pull(k, vs, fs) : nil;
     if (!d) return nil;
     NSError *e = nil; int off = !k->border; id<MTLRenderPipelineState> ps = pso_build_ex(d, off, &e, 0);
     if (!ps) {   // the pulling base is neither made nor archived: build it in the background for the pair's next miss
-        pbase_key bk; pbase_key_of(d, off, &bk); NSData *kd = [NSData dataWithBytes:&bk length:sizeof bk];
-        os_unfair_lock_lock(&g_hy_lock); if (!g_hy_kick_set) g_hy_kick_set = [NSMutableSet set];
-        int fresh = ![g_hy_kick_set containsObject:kd]; if (fresh) [g_hy_kick_set addObject:kd]; os_unfair_lock_unlock(&g_hy_lock);
-        if (fresh) { g_hy_kicked++; dispatch_async(pp_bg_queue(), ^{ NSError *be = nil; (void)pso_build(d, off, &be); }); }
-        g_hy_none++; return nil;
+        if (kick_bg) {
+            pbase_key bk; pbase_key_of(d, off, &bk); NSData *kd = [NSData dataWithBytes:&bk length:sizeof bk];
+            os_unfair_lock_lock(&g_hy_lock); if (!g_hy_kick_set) g_hy_kick_set = [NSMutableSet set];
+            int fresh = ![g_hy_kick_set containsObject:kd]; if (fresh) [g_hy_kick_set addObject:kd]; os_unfair_lock_unlock(&g_hy_lock);
+            if (fresh) { g_hy_kicked++; dispatch_async(pp_bg_queue(), ^{ NSError *be = nil; (void)pso_build(d, off, &be); }); }
+            g_hy_none++;
+        }
+        return nil;
     }
     g_hy_made++; hm_put_id(&g_pso_hy, k, ps);
     return ps;
 }
+static __unsafe_unretained id<MTLRenderPipelineState> hybrid_get(const pso_key *k, NvShader *vs, NvShader *fs) { return hybrid_get_ex(k, vs, fs, 1); }
 void mtl_hybrid_stats(uint64_t *draws, uint64_t *made, uint64_t *none) { *draws = g_hy_draws; *made = g_hy_made; *none = g_hy_none; }
 // The pipeline time line of the timing summary (hle_nvn.c), the difference since the last call
 void mtl_pso_line(char *o, size_t n) {
@@ -9497,20 +9542,30 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get_(NvProg *pr, MTLRe
     id<MTLRenderPipelineState> ps = nil; int took = 0;
     NSError *e = nil; uint64_t bt = bp_now(), pred0 = g_pt_pred_ns;
     g_pso_pull = 0; int why = g_pso_lmap ? 1 : ms_fn ? 2 : 0;
-    if (!took && !g_pso_lmap && !ms_fn && hybrid_on()) {
+    // 仅对具有顶点属性拉取入口的常规 3D 网格与粒子材质启用异步非阻塞构建，排除全屏后处理与屏幕空间 UI 通道以防闪烁
+    int can_async = pso_async_on() && !g_pso_lmap && !ms_fn && vs->has_pull && !vs->layer_out && vs->rf.nv > 0;
+    if (!took && !g_pso_lmap && !ms_fn && (hybrid_on() || can_async)) {
         why = !vs->has_pull || vs->layer_out ? 3 : 4;
         int st = pso_pend_try(&k, &ps);
         if (st == 2) took = 1;   // built in the background (nil: it failed, and is built again below for its message)
         else {
             if (st == 0) ps = pso_build_ex(pso_desc(&k, vs, fs, nil, 0), !k.border, &e, 0);   // its base made or archived: no compile
-            if (!ps) {
+            if (!ps && hybrid_on()) {
                 // Demand first (main's order): the draw's own pipeline is queued before the prediction admits speculative builds; with a stand-in nothing waits for it
-                __unsafe_unretained id<MTLRenderPipelineState> h = hybrid_get(&k, vs, fs);
+                __unsafe_unretained id<MTLRenderPipelineState> h = hybrid_get_ex(&k, vs, fs, !can_async);
                 if (h) {
                     if (st == 0) pso_pend_demand(&k, vs, fs);
                     g_pso_pull = 1; g_hy_ns += bp_now() - bt;
                     if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; uint64_t t0 = bp_now(); pso_predict_rest(); g_bp_pso_ns += bp_now() - t0; }
                     return h;
+                }
+            }
+            if (!ps && can_async) {
+                // 异步投递至后台编译队列并立即跳过当前未就绪绘制，将提交线程编译阻塞降为 0 ms；首次触发时并行预取本帧剩余着色器库
+                if (st == 1 || pso_pend_demand_q(&k, vs, fs, pp_async_queue())) {
+                    if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; shader_prefetch_rest(); }
+                    g_bp_pso_ns += bp_now() - bt;
+                    return nil;
                 }
             }
         }
@@ -9535,9 +9590,13 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get_(NvProg *pr, MTLRe
     hm_put_id(&g_pso, &k, ps);
     // Metal may serialize requests internally. Submit the pipeline needed now before speculative work, and preserve record-on-use above.
     static int predict = -1; if (predict < 0) { const char *e = getenv("DM_NVN_PREDICT"); predict = !(e && !strcmp(e, "0")); if (!predict) MLOG("DM_NVN_PREDICT=0: no parallel precompile prediction"); }
-    if (predict && g_pp_submit_mark != g_sub_serial) {
-        g_pp_submit_mark = g_sub_serial; uint64_t scan_t0 = bp_now(); pso_predict_rest();
+    if (predict && !(pso_async_on() && took) && g_pp_submit_mark != g_sub_serial) {
+        g_pp_submit_mark = g_sub_serial; g_pp_exhaust_sub = 0; uint64_t scan_t0 = bp_now(); pso_predict_rest();
         g_bp_pso_ns += bp_now() - scan_t0;   // Keep lookahead work in the pipeline-miss timing, as before
+    } else if (predict && !pso_async_on() && !took && g_pp_exhaust_sub != g_sub_serial && pso_pend_spec_active() < PSO_PEND_ACTIVE) {
+        // 大型提交在前一批推测管线被消费后继续滑动预测窗口，防止同帧大量新招式管线退化为提交线程单核串行编译
+        uint64_t scan_t0 = bp_now(); pso_predict_rest_(); uint64_t scan_dt = bp_now() - scan_t0;
+        g_pt_pred_n++; g_pt_pred_ns += scan_dt; g_bp_pso_ns += scan_dt;
     }
     return ps;
 }
@@ -11670,13 +11729,16 @@ static void pso_predict_rest_(void) {
     // With hybrid pipelines a predicted draw whose pulling stand-in is ready (made here, from its base made or archived: the work its draw would do) will not wait, and builds
     // its own pipeline on demand (pso_pend_demand); the budget goes to the draws that would wait (a pair whose pulling base is not made yet)
     int admitted = 0, hy = hybrid_on();
-    for (int i = 0; i < na + nb && admitted < PSO_PREDICT_BUDGET; i++) {
+    for (int i = 0; i < na + nb; i++) {
+        if (admitted >= PSO_PREDICT_BUDGET) break;
         const pso_key *qk = i < na ? &qa[i].k : &qb[i - na].k; NvShader *qv = (__bridge NvShader *)(i < na ? qa[i].vs : qb[i - na].vs), *qf = (__bridge NvShader *)(i < na ? qa[i].fs : qb[i - na].fs);
         if (hm_get_id(&g_pso, qk)) continue;
         if (pso_base_made(qk, qv, qf)) { hm_put_id(&g_pp_easy, qk, NSNull.null); continue; }
-        if (hy && hybrid_get(qk, qv, qf) != nil) continue;
+        // 仅检查已就绪或已归档的拉取替身基座，不在预测扫描中触发后台拉取基座编译以免争抢编译器拖慢主线程
+        if (hy && hybrid_get_ex(qk, qv, qf, 0) != nil) continue;
         admitted += pso_pend_kick(qk, qv, qf);
     }
+    if (!admitted) g_pp_exhaust_sub = g_sub_serial;
     memcpy(&S, &Ssave, sizeof S); R.sc = sc0; R.has_sc = has_sc0; args_dirty_all(); g_pso_dirty = pso_dirty; g_dss_dirty = dss_dirty; prog_resolve();
     static int logged; if (g_pp_kicked > (uint64_t)kicked0 && logged++ < 20) MLOG("parallel precompile: %d draws left in this submission, %d pipelines handed to the background", draws, (int)g_pp_kicked - kicked0);
 }
