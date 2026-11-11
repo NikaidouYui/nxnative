@@ -21,32 +21,32 @@ private struct CloudSavesSection: View {
     var body: some View {
         Section {
             HStack {
-                Text("Cloud saves")
+                Text("云存档")
                 Spacer()
-                Text(folder.isEmpty ? "Off" : (folder as NSString).lastPathComponent)
+                Text(folder.isEmpty ? "关闭" : (folder as NSString).lastPathComponent)
                     .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
-            Button(folder.isEmpty ? "Choose a folder in iCloud Drive…" : "Choose a different folder…") { picking = true }
+            Button(folder.isEmpty ? "在 iCloud 云盘中选择文件夹…" : "更换文件夹…") { picking = true }
                 // The sheet sits on the button, not on the Section: SwiftUI hands a Section's modifiers to every row, so one tap presented a picker per row and they invalidated each other (LNPANDY/NX2Apple#315).
                 .sheet(isPresented: $picking) {
                     DocumentPicker(types: [.folder]) { url in
                         picking = false
                         if dm_store_cloud_saves(url) {
-                            note = "Saved. The game uses this folder when you press Play."
+                            note = "已保存。点击“开始游戏”后将使用此文件夹同步存档。"
                             refresh()
                         } else {
-                            note = "That folder could not be remembered — try a different one."
+                            note = "无法记住该文件夹，请换一个文件夹重试。"
                         }
                     } onCancel: { picking = false }
                 }
             if !folder.isEmpty {
-                Button("Turn off cloud saves", role: .destructive) {
+                Button("关闭云存档", role: .destructive) {
                     dm_clear_cloud_saves(); refresh(); note = ""
                 }
             }
         } footer: {
             Text(note.isEmpty
-                 ? "Choose a folder in iCloud Drive, and the same one in the Mac app's Cloud saves. The save comes in when the game starts and goes out after each save; a save that is replaced is kept in save-backups."
+                 ? "在 iCloud 云盘中选择一个文件夹（Mac 端云存档也选同一个文件夹）。游戏启动时会自动拉取存档，每次保存后自动上传；被覆盖的旧存档会保留在 save-backups 中。"
                  : note)
         }
         .onAppear(perform: refresh)
@@ -56,7 +56,7 @@ private struct CloudSavesSection: View {
         var stale: ObjCBool = false
         folder = dm_cloud_saves_path(&stale) ?? ""
         if stale.boolValue && folder.isEmpty {
-            note = "The folder you chose before is no longer readable (the app was signed differently). Please choose it again."
+            note = "之前选择的文件夹已无法读取（应用重签名后权限变更），请重新选择。"
         }
     }
 }
@@ -86,9 +86,13 @@ private struct DocumentPicker: UIViewControllerRepresentable {
             self.onPick = onPick; self.onCancel = onCancel
         }
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            fputs("launcher: documentPicker didPickDocumentsAt count=\(urls.count)\n", stderr)
             if let url = urls.first { onPick(url) } else { onCancel() }
         }
-        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { onCancel() }
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            fputs("launcher: documentPicker wasCancelled\n", stderr)
+            onCancel()
+        }
     }
 }
 
@@ -112,7 +116,7 @@ private struct LauncherView: View {
                     }
                     Text((info("CFBundleDisplayName") as? String) ?? "Game")
                         .font(.title.weight(.bold)).multilineTextAlignment(.center)
-                    Text("Version \((info("CFBundleShortVersionString") as? String) ?? "")")
+                    Text("版本 \((info("CFBundleShortVersionString") as? String) ?? "")")
                         .font(.callout).foregroundStyle(.secondary)
                     playButton
                 }
@@ -122,21 +126,21 @@ private struct LauncherView: View {
                     ForEach(m.sections, id: \.self) { section in
                         let rows = m.rows(in: section)
                         if !rows.isEmpty {
-                            Section(section) {
+                            Section(localizedSection(section)) {
                                 ForEach(rows) { SettingRow(s: $0, m: m) }
                             }
                         }
                     }
                     Section {
-                        Button("Reset to tested defaults") { m.reset() }
+                        Button("恢复默认设置") { m.reset() }
                             .disabled(!m.changed)
                     } footer: {
-                        Text("Brings back all settings this game was tested with.")
+                        Text("将所有选项恢复为此游戏经过测试的默认配置。")
                     }
                     CloudSavesSection()
                     Section {
                         HStack {
-                            Text("Memory available")
+                            Text("可用内存")
                             Spacer()
                             Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
                         }
@@ -151,12 +155,12 @@ private struct LauncherView: View {
         .confirmationDialog(SaveSyncReport.chooseTitle, isPresented: isAsking(.choose), titleVisibility: .visible, presenting: report) { r in
             Button(r.localLabel(here: "iPhone")) { go(r.localChoice) }
             Button(r.cloudLabel) { go(r.cloudChoice) }
-            Button("Cancel", role: .cancel) {}
+            Button("取消", role: .cancel) {}
         } message: { r in Text(r.chooseMessage(here: "iPhone")) }
         .confirmationDialog(SaveSyncReport.unreadableTitle, isPresented: isAsking(.unreadable), titleVisibility: .visible, presenting: report) { r in
-            Button("Play This iPhone's Save") { go("offline") }   // the mount does not wait for the cloud again
-            Button("Try Again") { DispatchQueue.main.async { start() } }
-            Button("Cancel", role: .cancel) {}
+            Button("使用此 iPhone 的存档开始") { go("offline") }   // the mount does not wait for the cloud again
+            Button("重试") { DispatchQueue.main.async { start() } }
+            Button("取消", role: .cancel) {}
         } message: { r in Text(r.unreadableMessage(here: "iPhone")) }
         .task {
             while !Task.isCancelled {
@@ -166,13 +170,23 @@ private struct LauncherView: View {
         }
     }
 
+    // 将内部分组标识映射为中文标题
+    private func localizedSection(_ section: String) -> String {
+        switch section {
+        case "Game": return "游戏"
+        case "Controls": return "控制"
+        case "Performance": return "性能"
+        default: return section
+        }
+    }
+
     @ViewBuilder var playButton: some View {
-        let button = Button(action: start) { Text("Play").font(.title3.weight(.semibold)).frame(maxWidth: 220) }.controlSize(.large).disabled(checking)
+        let button = Button(action: start) { Text("开始游戏").font(.title3.weight(.semibold)).frame(maxWidth: 220) }.controlSize(.large).disabled(checking)
         if #available(iOS 26.0, *) { button.buttonStyle(.glassProminent) } else { button.buttonStyle(.borderedProminent) }
         if checking {
             VStack(spacing: 6) {
-                HStack(spacing: 6) { ProgressView(); Text("Checking the cloud save…").font(.callout).foregroundStyle(.secondary) }
-                Button("Play Without It") { checking = false; go("offline") }.font(.callout)
+                HStack(spacing: 6) { ProgressView(); Text("正在检查云存档…").font(.callout).foregroundStyle(.secondary) }
+                Button("跳过并直接开始") { checking = false; go("offline") }.font(.callout)
             }
         }
     }

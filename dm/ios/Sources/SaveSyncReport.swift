@@ -60,20 +60,18 @@ struct SaveSyncReport {
         if cloudDevice.hasPrefix("iPhone") { return "iPhone" }
         if cloudDevice.hasPrefix("iPad") { return "iPad" }
         if cloudDevice.contains("Mac") { return "Mac" }
-        return cloudDevice.isEmpty ? "another device" : cloudDevice
+        return cloudDevice.isEmpty ? "其它设备" : cloudDevice
     }
 
     /// `here`: "iPhone" or "Mac"
-    func localLabel(here: String) -> String { "This \(here)'s: \(Self.when(localSaved)), \(Self.size(localSize))" }
-    var cloudLabel: String { "The \(cloudDeviceKind)'s in iCloud: \(Self.when(cloudSaved)), \(Self.size(cloudSize))" }
-    static let chooseTitle = "Which save do you want to play?"
+    func localLabel(here: String) -> String { "此 \(here) 存档：\(Self.when(localSaved))，\(Self.size(localSize))" }
+    var cloudLabel: String { "iCloud 中的 \(cloudDeviceKind) 存档：\(Self.when(cloudSaved))，\(Self.size(cloudSize))" }
+    static let chooseTitle = "请选择要游玩的存档"
     func chooseMessage(here: String) -> String {
-        "Both this \(here)'s save and the one in iCloud changed since they were last the same. The newer one is not always the one with more progress: "
-            + "a new game saved a minute later is newer. The one you don't pick is kept in the save's backups folder."
+        "自上次同步以来，此 \(here) 上的存档与 iCloud 中的存档均发生了变更。时间更新的存档不一定进度更远（例如刚新建一分钟的存档时间更新）。未被选中的存档将保留在存档备份目录中。"
     }
-    static let unreadableTitle = "The cloud save didn't come"
+    static let unreadableTitle = "未能获取云存档"
     func unreadableMessage(here: String) -> String {
-        "iCloud didn't deliver this game's save in \(Self.waitMs / 1000) seconds. If you play this \(here)'s save now, it is not sent to iCloud "
-            + "until it has been compared with the cloud's at a later start."
+        "iCloud 未能在 \(Self.waitMs / 1000) 秒内下载此游戏的云存档。如果现在使用此 \(here) 上的存档游玩，在下次启动并与云端存档完成比对前不会覆盖上传至 iCloud。"
     }
 }
